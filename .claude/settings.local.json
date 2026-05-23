@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx create-next-app@latest md-converter --typescript --tailwind --app --no-src-dir --import-alias \"@/*\" --no-eslint)",
+      "Bash(printf 'n\\\\n')",
+      "Bash(printf 'n\\\\nn\\\\n')",
+      "Bash(yes n:*)",
+      "Bash(npm install:*)",
+      "Bash(npm show:*)",
+      "Bash(npx tsc:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(dir \"C:\\\\Users\\\\dawad\\\\Downloads\\\\Across misc\\\\MD Converter\\\\md-converter\\\\node_modules\\\\pdf-parse\" /b)"
+    ]
+  }
+}
