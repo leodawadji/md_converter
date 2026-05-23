@@ -49,6 +49,7 @@ export default function ConverterPage() {
         fileType: selected[0].fileType,
         rawText: selected.map(d => d.rawText).join('\n\n'),
         markdown: mergedMarkdown,
+        tables: selected.flatMap(d => d.tables),
         analysis: selected[0].analysis,
         selected: false,
         createdAt: new Date().toISOString(),

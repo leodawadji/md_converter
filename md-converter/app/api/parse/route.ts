@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { parseTxt } from '@/lib/parsers/txt'
 import { convertToMarkdown, detectDocumentType } from '@/lib/converter'
 import { analyzeDocument } from '@/lib/guardrails'
-import { convertWithMarkItDown } from '@/lib/services/markitdown'
+import { convertDocument } from '@/lib/services/convert'
 import {
   preprocessMarkdown,
   fixSplitHeadings,
@@ -11,7 +11,7 @@ import {
 } from '@/lib/enrichment'
 import type { EnrichmentResult } from '@/types'
 
-const MARKITDOWN_EXTENSIONS = new Set(['pdf', 'docx', 'xlsx', 'pptx', 'html', 'htm'])
+const EXTERNAL_CONVERT_EXTENSIONS = new Set(['pdf', 'docx', 'xlsx', 'pptx', 'html', 'htm'])
 
 export async function POST(req: NextRequest) {
   try {
@@ -23,7 +23,10 @@ export async function POST(req: NextRequest) {
     let markdown = ''
     let fileType: 'txt' | 'pdf' | 'docx' | 'paste' = 'paste'
     let originalName = 'paste'
-    let usedMarkItDown = false
+    let usedExternalConverter = false
+    let tables: Array<{ id: number; markdown: string; caption: string | null; page: number | null }> = []
+    let engine: 'docling' | 'markitdown' | undefined = undefined
+    let warnings: string[] = []
 
     if (pasteText) {
       rawText = pasteText
@@ -34,11 +37,15 @@ export async function POST(req: NextRequest) {
       const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
       const buffer = Buffer.from(await file.arrayBuffer())
 
-      if (MARKITDOWN_EXTENSIONS.has(ext)) {
-        markdown = await convertWithMarkItDown(buffer, file.name)
+      if (EXTERNAL_CONVERT_EXTENSIONS.has(ext)) {
+        const result = await convertDocument(buffer, file.name)
+        markdown = result.markdown
         rawText = markdown
+        tables = result.tables
+        engine = result.engine
+        warnings = result.warnings
         fileType = (ext === 'pdf' || ext === 'docx') ? ext : 'txt'
-        usedMarkItDown = true
+        usedExternalConverter = true
       } else {
         rawText = await parseTxt(buffer.toString('utf-8'))
         fileType = 'txt'
@@ -47,7 +54,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Nenhum arquivo ou texto fornecido.' }, { status: 400 })
     }
 
-    if (!usedMarkItDown) {
+    if (!usedExternalConverter) {
       const docType = detectDocumentType(rawText)
       markdown = convertToMarkdown(rawText, docType)
     }
@@ -55,14 +62,14 @@ export async function POST(req: NextRequest) {
     // Structural post-processing
     markdown = preprocessMarkdown(markdown)
     markdown = fixSplitHeadings(markdown)
-    rawText = usedMarkItDown ? markdown : rawText
+    rawText = usedExternalConverter ? markdown : rawText
 
     const docType = detectDocumentType(rawText)
     const analysis = analyzeDocument(markdown, docType)
 
-    // Enrich: extract article structure + optional LLM topics/temas/missing headings
+    // Enrich: extract article structure + chunked LLM topics/temas/missing headings
     let enrichment: EnrichmentResult = extractStructure(markdown, docType, originalName)
-    if (enrichment.articles.length > 0) {
+    if (enrichment.articles.length > 0 || markdown.length > 1000) {
       const llmResult = await enrichWithLLM(enrichment.articles, markdown).catch(() => ({
         enrichment: {},
         correctedMarkdown: markdown,
@@ -71,7 +78,17 @@ export async function POST(req: NextRequest) {
       markdown = llmResult.correctedMarkdown
     }
 
-    return NextResponse.json({ rawText, markdown, analysis, fileType, originalName, enrichment })
+    return NextResponse.json({
+      rawText,
+      markdown,
+      tables,
+      engine,
+      warnings,
+      analysis,
+      fileType,
+      originalName,
+      enrichment,
+    })
   } catch (err) {
     console.error('Parse error:', err)
     const message = err instanceof Error ? err.message : 'Erro ao processar o arquivo.'

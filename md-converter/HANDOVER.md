@@ -18,13 +18,18 @@ Next.js 15 app (App Router, TypeScript, Tailwind) that converts documents and we
 ## Architecture
 
 ### File-to-Markdown pipeline (`/api/parse`)
-1. **MarkItDown** (Python, `pip install markitdown[all]`) handles PDF/DOCX/XLSX/PPTX/HTML via `scripts/markitdown_convert.py`
-2. Custom TXT parser for `.txt` and pasted text
-3. `preprocessMarkdown` converts `// Title` → `## Title` (newsletter PDFs from some publishers)
-4. `fixSplitHeadings` merges headings broken across a blank line by PDF extraction (e.g. `## heading\n\ncontinuation.`)
-5. `extractStructure` finds `##` headings → builds `articles[]` array
-6. `enrichWithLLM` calls an LLM to generate specific `topics`, `tema` per article, and discovers articles that have **no `##` heading** by returning a `marker` phrase used to insert the heading into the markdown
-7. Returns `{markdown, enrichment}` — enrichment feeds the YAML frontmatter
+1. **Convert** (Python, `scripts/convert.py`):
+   - PDF → **Docling** (preserves tables, layout, multi-column). Falls back to MarkItDown if Docling fails.
+   - DOCX/PPTX/XLSX/HTML → **MarkItDown**.
+   - TXT/paste → no external conversion.
+2. **Table extraction** — for PDFs, Docling returns tables as a separate array.
+   Each table is replaced inline with `[ver Tabela N]` and appended as a
+   `### Tabela N` block under a `## Tabelas` section at the end of the document.
+3. `preprocessMarkdown` converts `// Title` → `## Title`.
+4. `fixSplitHeadings` merges headings broken across a blank line by PDF extraction.
+5. `extractStructure` finds `##` headings → builds `articles[]` array.
+6. `enrichWithLLM` enriches with chunked LLM analysis (no more 4000-char truncation).
+7. Returns `{markdown, tables, enrichment, engine, warnings}`.
 
 ### YAML frontmatter (exported `.md`)
 ```yaml
@@ -77,7 +82,7 @@ lib/
   converter.ts                Text → markdown heuristic conversion
   guardrails.ts               Quality analysis (tokenEstimate, qualityScore)
   services/
-    markitdown.ts             Spawns Python markitdown_convert.py
+    convert.ts                Spawns Python convert.py (hybrid Docling + MarkItDown)
     summarize.ts              Wraps @steipete/summarize CLI (Windows-safe)
     transcriber.ts            WhisperX diarization pipeline
     youtube-downloader.ts     yt-dlp audio download
@@ -88,7 +93,7 @@ components/
   DocumentCard.tsx / DocumentList.tsx / EditorPanel.tsx / PreviewPanel.tsx
 
 scripts/
-  markitdown_convert.py       Python bridge: receives file path, outputs JSON {markdown}
+  convert.py                  Python bridge: hybrid Docling (PDF) + MarkItDown (Office), outputs JSON {markdown, tables, engine, warnings}
 
 types/
   index.ts                    ParsedDocument, EnrichmentResult, ArticleInfo
@@ -114,8 +119,9 @@ FIRECRAWL_API_KEY=     # Optional — better JS-heavy site scraping
 
 | Tool | Install | Used for |
 |---|---|---|
-| Python 3 | system | MarkItDown |
-| `markitdown[all]` | `pip install "markitdown[all]"` | PDF/DOCX/XLSX/PPTX conversion |
+| Python 3.10+ | system | Docling + MarkItDown |
+| `docling` | `pip install docling` | PDF conversion (primary engine) — first run downloads ~1GB of models |
+| `markitdown[all]` | `pip install "markitdown[all]"` | DOCX/XLSX/PPTX conversion + PDF fallback |
 | `@steipete/summarize` | `npm i -g @steipete/summarize` | URL scraping + YouTube captions |
 | `yt-dlp` | `pip install yt-dlp` | YouTube audio download (WhisperX path) |
 | `ffmpeg` | `winget install Gyan.FFmpeg` | Audio processing (WhisperX path) |

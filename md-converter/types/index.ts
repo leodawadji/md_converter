@@ -13,6 +13,13 @@ export interface EnrichmentResult {
   articles: ArticleInfo[]
 }
 
+export interface ExtractedTable {
+  id: number
+  markdown: string
+  caption: string | null
+  page: number | null
+}
+
 export type GuardrailLevel = 'ok' | 'warn' | 'critical'
 
 export interface SplitSuggestion {
@@ -47,6 +54,9 @@ export interface ParsedDocument {
   fileType: 'txt' | 'pdf' | 'docx' | 'paste' | 'url'
   rawText: string
   markdown: string
+  tables: ExtractedTable[]
+  engine?: 'docling' | 'markitdown'
+  warnings?: string[]
   analysis: GuardrailResult
   enrichment?: EnrichmentResult
   selected: boolean

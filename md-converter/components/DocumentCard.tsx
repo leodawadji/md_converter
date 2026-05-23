@@ -61,6 +61,14 @@ export default function DocumentCard({ doc, isActive, onSelect, onDelete, onTogg
             <span className="text-xs text-zinc-500">{docTypeLabel[doc.analysis.docType]}</span>
             <span className="text-zinc-700">·</span>
             <GuardrailBar analysis={doc.analysis} compact />
+            {doc.tables && doc.tables.length > 0 && (
+              <>
+                <span className="text-zinc-700">·</span>
+                <span className="text-xs text-emerald-400">
+                  {doc.tables.length} tabela{doc.tables.length !== 1 ? 's' : ''}
+                </span>
+              </>
+            )}
           </div>
         </div>
         <button

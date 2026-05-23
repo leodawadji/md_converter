@@ -13,12 +13,7 @@ export interface EnrichmentResult {
   articles: ArticleInfo[]
 }
 
-/**
- * Convert // Title patterns → ## Title.
- * Handles plain (// Title) and bold-wrapped (**// Title**) variants,
- * since MarkItDown may wrap PDF bold headings in ** markers.
- * Trims trailing whitespace/carriage-returns from captured title.
- */
+// Convert "// Title" patterns to "## Title" (plain and bold-wrapped variants).
 export function preprocessMarkdown(markdown: string): string {
   return markdown
     // **// Title** or ***// Title*** (bold/italic from PDF bold headings)
@@ -178,10 +173,78 @@ async function callLLM(prompt: string): Promise<string> {
 }
 
 /**
- * Enrich topics and article temas via LLM.
- * Also discovers articles that lack a ## heading by asking the LLM for a
- * "marker" (first unique phrase in the body), then inserts ## before it.
- * Returns enrichment data AND a corrected markdown string.
+ * Split markdown into chunks of ~chunkChars each, respecting ## boundaries.
+ */
+function chunkMarkdown(markdown: string, chunkChars = 8000): Array<{
+  index: number
+  content: string
+  firstHeading: string | null
+}> {
+  const sections = markdown.split(/\n(?=##\s)/)
+  const chunks: Array<{ index: number; content: string; firstHeading: string | null }> = []
+  let buffer = ''
+  let bufferFirstHeading: string | null = null
+
+  const flush = () => {
+    if (buffer.trim()) {
+      chunks.push({
+        index: chunks.length,
+        content: buffer,
+        firstHeading: bufferFirstHeading,
+      })
+    }
+    buffer = ''
+    bufferFirstHeading = null
+  }
+
+  for (const sec of sections) {
+    const headingMatch = sec.match(/^##\s+(.+)/)
+    const heading = headingMatch ? headingMatch[1].trim() : null
+
+    if (buffer.length + sec.length > chunkChars && buffer.length > 0) {
+      flush()
+    }
+    if (!bufferFirstHeading) bufferFirstHeading = heading
+    buffer += (buffer ? '\n' : '') + sec
+  }
+  flush()
+
+  return chunks
+}
+
+function buildEnrichmentPrompt(
+  knownTitles: string,
+  chunk: string,
+  chunkIndex: number,
+  totalChunks: number
+): string {
+  const partInfo = totalChunks > 1
+    ? `\n[Este e o trecho ${chunkIndex + 1} de ${totalChunks} do documento — analise APENAS o que esta visivel neste trecho.]\n`
+    : ''
+
+  return `Voce e editor de uma newsletter brasileira de mercado financeiro/tecnologia/negocios. Analise o markdown abaixo e retorne um JSON com dois campos:
+${partInfo}
+1. "topics": lista de 3-6 topicos semanticos ESPECIFICOS em portugues (2-5 palavras cada). Foque em entidades concretas (empresas, paises, setores, metricas), nao em categorias genericas.
+   ERRADO: ["Inteligencia Artificial", "Tecnologia", "Negocios", "Mercado Financeiro", "Economia"]
+   CERTO: ["Petrobras dividendos extraordinarios", "IPO Stone follow-on", "Selic 9.75% Copom", "Tesouro IPCA+ 2045"]
+
+2. "articles": array com TODOS os artigos/secoes deste trecho — incluindo os que nao tem heading ## no markdown.
+   Cada item deve ter:
+   - "titulo": titulo do artigo
+   - "tema": 2-4 palavras, assunto central
+   - "marker": SOMENTE para artigos que NAO tem heading ##  — primeira frase ou expressao literal e unica do corpo desse artigo.
+
+Headings ## ja detectados:
+${knownTitles}
+
+Markdown:
+${chunk}
+
+Retorne APENAS JSON valido, sem blocos de codigo.`
+}
+
+/**
+ * Enrich topics and article temas via LLM, with chunking for long documents.
  */
 export async function enrichWithLLM(
   knownArticles: ArticleInfo[],
@@ -189,82 +252,76 @@ export async function enrichWithLLM(
 ): Promise<{ enrichment: Partial<EnrichmentResult>; correctedMarkdown: string }> {
   if (!detectProvider()) return { enrichment: {}, correctedMarkdown: markdown }
 
-  const truncated = markdown.length > 4000
-    ? markdown.slice(0, 4000) + '\n...[truncado]'
-    : markdown
+  const chunks = chunkMarkdown(markdown, 8000)
+  const knownTitles = knownArticles.map(a => `- "${a.titulo}"`).join('\n')
+    || '(nenhum detectado automaticamente)'
 
-  const knownTitles = knownArticles.map(a => `- "${a.titulo}"`).join('\n') || '(nenhum detectado automaticamente)'
+  const chunkResults = await Promise.all(
+    chunks.map(async (chunk) => {
+      const prompt = buildEnrichmentPrompt(knownTitles, chunk.content, chunk.index, chunks.length)
+      try {
+        const raw = await callLLM(prompt)
+        const jsonStr = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
+        return JSON.parse(jsonStr)
+      } catch {
+        return null
+      }
+    })
+  )
 
-  const prompt = `Você é editor de uma newsletter brasileira de tecnologia/negócios. Analise o markdown abaixo e retorne um JSON com dois campos:
+  const allTopics = new Set<string>()
+  const allArticles: Array<{ titulo: string; tema?: string; marker?: string }> = []
 
-1. "topics": lista de 3-6 tópicos semânticos ESPECÍFICOS em português (2-5 palavras cada).
-   ERRADO (genérico demais): ["Inteligência Artificial", "Tecnologia", "Negócios e Empreendedorismo"]
-   CERTO (específico): ["IA generativa no varejo", "estratégia direct-to-consumer Nike", "regulação de plataformas digitais"]
+  for (const res of chunkResults) {
+    if (!res) continue
+    if (Array.isArray(res.topics)) {
+      res.topics.forEach((t: string) => allTopics.add(t))
+    }
+    if (Array.isArray(res.articles)) {
+      for (const a of res.articles) {
+        if (a.titulo) allArticles.push(a)
+      }
+    }
+  }
 
-2. "articles": array com TODOS os artigos do documento — incluindo os que não têm heading ## no markdown.
-   Cada item deve ter:
-   - "titulo": título do artigo (extraído do heading ## ou inferido do conteúdo)
-   - "tema": 2-4 palavras, assunto central do artigo
-   - "marker": SOMENTE para artigos que NÃO têm heading ## — copie aqui a primeira frase ou expressão literal e única do corpo desse artigo (será usada para inserir o heading no lugar certo)
+  let correctedMarkdown = markdown
+  const articlesWithIds: ArticleInfo[] = []
+  let idCounter = 1
 
-Headings ## já detectados automaticamente:
-${knownTitles}
+  for (const a of allArticles) {
+    const article: ArticleInfo = {
+      id: idCounter++,
+      titulo: String(a.titulo),
+      tema: a.tema ? String(a.tema) : undefined,
+    }
+    articlesWithIds.push(article)
 
-Markdown do documento:
-${truncated}
-
-Retorne APENAS JSON válido, sem blocos de código, sem texto fora do JSON.`
-
-  try {
-    const raw = await callLLM(prompt)
-    const jsonStr = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim()
-    const parsed = JSON.parse(jsonStr)
-
-    let correctedMarkdown = markdown
-    const allArticles: ArticleInfo[] = []
-
-    if (Array.isArray(parsed.articles)) {
-      let idCounter = 1
-      for (const a of parsed.articles) {
-        if (!a.titulo) continue
-        const article: ArticleInfo = {
-          id: idCounter++,
-          titulo: String(a.titulo),
-          tema: a.tema ? String(a.tema) : undefined,
-        }
-        allArticles.push(article)
-
-        // Insert a ## heading for articles the LLM found but that have no heading yet
-        if (a.marker && typeof a.marker === 'string' && a.marker.length >= 5) {
-          // Skip if any heading already contains this article's title
-          const headingExists = correctedMarkdown
-            .split('\n')
-            .some(l => l.startsWith('## ') && l.toLowerCase().includes(article.titulo.toLowerCase().slice(0, 20)))
-          if (!headingExists) {
-            const markerIdx = correctedMarkdown.indexOf(a.marker)
-            if (markerIdx !== -1) {
-              const lineStart = correctedMarkdown.lastIndexOf('\n', markerIdx) + 1
-              const linePrefix = correctedMarkdown.slice(lineStart, markerIdx)
-              if (!linePrefix.startsWith('#') && !linePrefix.startsWith('-')) {
-                correctedMarkdown =
-                  correctedMarkdown.slice(0, lineStart) +
-                  `## ${article.titulo}\n\n` +
-                  correctedMarkdown.slice(lineStart)
-              }
-            }
+    if (a.marker && typeof a.marker === 'string' && a.marker.length >= 5) {
+      const titleSlice = article.titulo.toLowerCase().slice(0, 20)
+      const headingExists = correctedMarkdown
+        .split('\n')
+        .some(l => l.startsWith('## ') && l.toLowerCase().includes(titleSlice))
+      if (!headingExists) {
+        const markerIdx = correctedMarkdown.indexOf(a.marker)
+        if (markerIdx !== -1) {
+          const lineStart = correctedMarkdown.lastIndexOf('\n', markerIdx) + 1
+          const linePrefix = correctedMarkdown.slice(lineStart, markerIdx)
+          if (!linePrefix.startsWith('#') && !linePrefix.startsWith('-')) {
+            correctedMarkdown =
+              correctedMarkdown.slice(0, lineStart) +
+              `## ${article.titulo}\n\n` +
+              correctedMarkdown.slice(lineStart)
           }
         }
       }
     }
+  }
 
-    return {
-      enrichment: {
-        topics: Array.isArray(parsed.topics) ? parsed.topics : [],
-        articles: allArticles.length > 0 ? allArticles : undefined,
-      },
-      correctedMarkdown,
-    }
-  } catch {
-    return { enrichment: {}, correctedMarkdown: markdown }
+  return {
+    enrichment: {
+      topics: [...allTopics].slice(0, 8),
+      articles: articlesWithIds.length > 0 ? articlesWithIds : undefined,
+    },
+    correctedMarkdown,
   }
 }
